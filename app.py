@@ -227,13 +227,23 @@ def build_suppliers(raw: pd.DataFrame) -> pd.DataFrame:
     df["SupplierID"] = pd.to_numeric(df["SupplierID"], errors="coerce")
     df = df.dropna(subset=["SupplierID"])
     df["SupplierID"] = df["SupplierID"].astype(int)
-    return df[["SupplierID", "SupplierName", "Company"]].reset_index(drop=True)
+
+    # Remove duplicate manufacturers (identical supplier names)
+    df = df.drop_duplicates(subset=["SupplierName"], keep="first")
+
+    # Return only columns that exist
+    return_cols = [col for col in ["SupplierID", "SupplierName", "Company"] if col in df.columns]
+    return df[return_cols].reset_index(drop=True)
 
 
 def build_transactions(raw: pd.DataFrame) -> pd.DataFrame:
     df = _normalise_columns(raw.copy(), TRANSACTION_COL_MAP)
     df = _drop_descriptor_rows(df)
     df = clean_dataframe(df)
+
+    # Convert all object columns to string to avoid Arrow serialization issues
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].astype(str)
 
     if "Period" in df.columns:
         period = df["Period"]
@@ -279,17 +289,34 @@ def build_transactions(raw: pd.DataFrame) -> pd.DataFrame:
 
 def merge_data(transactions: pd.DataFrame, suppliers: pd.DataFrame) -> pd.DataFrame:
     if "SupplierID" in transactions.columns and "SupplierID" in suppliers.columns and not suppliers.empty:
+        # Only merge on columns that exist
+        merge_cols = ["SupplierID"]
+        if "Company" in suppliers.columns:
+            merge_cols.append("Company")
+
+        suppliers_to_merge = suppliers[merge_cols].drop_duplicates()
         merged = transactions.merge(
-            suppliers[["SupplierID", "Company"]].drop_duplicates(),
+            suppliers_to_merge,
             on="SupplierID",
             how="left",
         )
-        merged["Company"] = merged["Company"].fillna("Unknown")
+        if "Company" in merged.columns:
+            merged["Company"] = merged["Company"].fillna("Unknown")
+        else:
+            merged["Company"] = "Unknown"
     else:
         merged = transactions.copy()
-        merged["Company"] = "Unknown"
+        if "Company" not in merged.columns:
+            merged["Company"] = "Unknown"
 
     merged["SupplierName"] = merged["SupplierName"].fillna("Unknown")
+
+    # Deduplicate manufacturer/supplier names (remove identical duplicates)
+    # Only use columns that actually exist in the dataframe
+    dedup_cols = [col for col in ["SupplierID", "SupplierName", "Company"] if col in merged.columns]
+    if dedup_cols and len(dedup_cols) > 0:
+        merged = merged.drop_duplicates(subset=dedup_cols, keep="first")
+
     return merged
 
 
@@ -385,13 +412,13 @@ def main() -> None:
             col_raw, col_clean = st.columns(2)
             with col_raw:
                 st.caption("Raw")
-                st.dataframe(transactions_raw.head(20), use_container_width=True)
+                st.dataframe(transactions_raw.head(20), width='stretch')
             with col_clean:
                 st.caption("Cleaned")
-                st.dataframe(transactions.head(20), use_container_width=True)
+                st.dataframe(transactions.head(20), width='stretch')
         with tab_sup:
             st.caption("Suppliers (cleaned)")
-            st.dataframe(suppliers.head(20), use_container_width=True)
+            st.dataframe(suppliers.head(20), width='stretch')
 
     # ── Sidebar filters ─────────────────────────────────────────────────
     with st.sidebar:
@@ -478,7 +505,7 @@ def main() -> None:
 
     # ── Data table ───────────────────────────────────────────────────────
     st.subheader("Cleaned Dataset")
-    st.dataframe(view, use_container_width=True, height=400)
+    st.dataframe(view, width='stretch', height=400)
 
     # ── Download ─────────────────────────────────────────────────────────
     st.download_button(
