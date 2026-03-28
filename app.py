@@ -1,4 +1,5 @@
 import io
+from difflib import SequenceMatcher
 from typing import Optional
 
 import pandas as pd
@@ -317,7 +318,69 @@ def merge_data(transactions: pd.DataFrame, suppliers: pd.DataFrame) -> pd.DataFr
     if dedup_cols and len(dedup_cols) > 0:
         merged = merged.drop_duplicates(subset=dedup_cols, keep="first")
 
+    # Apply fuzzy matching to combine similar supplier names
+    merged = _fuzzy_match_suppliers(merged)
+
     return merged
+
+
+def _fuzzy_match_suppliers(df: pd.DataFrame, threshold: float = 0.88) -> pd.DataFrame:
+    """Use fuzzy matching to group similar supplier names and combine their amounts.
+
+    Supplier names with >= threshold similarity are grouped together.
+    Amounts (Debit, Credit) are summed for each group.
+    The canonical name is the first (longest) name in each group.
+    """
+    if df.empty or "SupplierName" not in df.columns:
+        return df
+
+    df = df.copy()
+    unique_names = sorted(df["SupplierName"].dropna().unique().tolist(),
+                          key=lambda x: -len(str(x)))
+
+    # Build groups: map each unique name to its canonical (first seen) name
+    name_mapping = {}
+
+    for name in unique_names:
+        if name in name_mapping:
+            # Already assigned to a group
+            continue
+
+        # Start a new group with this name as canonical
+        canonical = name
+        name_mapping[name] = canonical
+
+        # Find all other names similar to this one
+        for other_name in unique_names:
+            if other_name == name or other_name in name_mapping:
+                continue
+
+            # Calculate similarity
+            similarity = SequenceMatcher(None, canonical.lower(), other_name.lower()).ratio()
+            if similarity >= threshold:
+                name_mapping[other_name] = canonical
+
+    # Apply the mapping to create a canonical supplier column
+    df["CanonicalSupplier"] = df["SupplierName"].map(
+        lambda x: name_mapping.get(str(x), str(x))
+    )
+
+    # Aggregate by canonical supplier, summing amounts
+    agg_dict = {}
+    amount_cols = ["Debit", "Credit", "Amount"]
+    for col in amount_cols:
+        if col in df.columns:
+            agg_dict[col] = "sum"
+
+    # Keep other columns by taking first non-null value
+    for col in df.columns:
+        if col not in ["SupplierName", "CanonicalSupplier"] + amount_cols:
+            agg_dict[col] = "first"
+
+    grouped = df.groupby("CanonicalSupplier", as_index=False).agg(agg_dict)
+    grouped = grouped.rename(columns={"CanonicalSupplier": "SupplierName"})
+
+    return grouped.reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
