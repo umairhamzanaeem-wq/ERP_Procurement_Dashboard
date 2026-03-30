@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Optional
 
@@ -561,13 +562,82 @@ def _parse_generic(df: pd.DataFrame, filename: str = "") -> pd.DataFrame:
     return df[[c for c in keep if c in df.columns]].reset_index(drop=True)
 
 
+_INVOICE_SUFFIXES = (
+    "_rechnungseingang", "_rechnungseingan", "_rechnungseing",
+    "_e-rechnung", "_rechnung", "_rechnungseing",
+    "rechnungseingang", "rechnungseing",
+)
+
+_LEGAL_SUFFIXES = (
+    " gmbh & co. kg", " gmbh & co.kg", " gmbh & co kg",
+    " gmbh & co", " gmbh", " ag", " kg", " ohg", " e.k.",
+    " e.k", " mbh", " ug", " se", " co.", " inc.", " ltd.",
+    " corp.", " s.a.", " s.r.l.",
+)
+
+
+def _german_ascii_fold(s: str) -> str:
+    """Lowercase, expand umlauts, strip accents (Müller/Mueller/Muller align better)."""
+    s = s.strip().lower()
+    repl = {
+        "ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss",
+        "à": "a", "á": "a", "â": "a", "ã": "a",
+        "è": "e", "é": "e", "ê": "e", "ë": "e",
+        "ì": "i", "í": "i", "î": "i", "ï": "i",
+        "ò": "o", "ó": "o", "ô": "o", "õ": "o",
+        "ù": "u", "ú": "u", "û": "u",
+        "ý": "y", "ÿ": "y", "ñ": "n", "ç": "c",
+    }
+    s = "".join(repl.get(c, c) for c in s)
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _supplier_match_key(name: str) -> str:
+    """Stable key for grouping: strips booking refs, Skontoabzug line IDs, invoice tails."""
+    if not name or str(name).strip().lower() in ("", "nan", "unknown", "none"):
+        return ""
+    n = _german_ascii_fold(str(name))
+
+    for suf in _LEGAL_SUFFIXES:
+        if n.endswith(suf):
+            n = n[: -len(suf)].strip()
+
+    n = re.sub(r"\s*#\s*\d+.*$", "", n)
+    n = re.sub(r"\s+proj\.?\s*_.*$", "", n, flags=re.IGNORECASE)
+    n = re.sub(r"\s+wu\s*$", "", n, flags=re.IGNORECASE)
+
+    for suf in _INVOICE_SUFFIXES:
+        if suf in n:
+            n = n[: n.index(suf)].strip()
+            break
+
+    n = re.sub(r"\s+/\s*hn-v\s+.*$", "", n, flags=re.IGNORECASE)
+    n = re.sub(r"\s+/\s*\d[\d\s]*$", "", n)
+    n = re.sub(r"\s+/\s*\d+$", "", n)
+
+    sk = re.match(r"^(skontoabzug)\s+(\d+)\s*$", n)
+    if sk:
+        return f"{sk.group(1)} {sk.group(2)}"
+
+    hm = re.search(r"hn-?\s*v\s*(\d+)", n.replace(" ", ""))
+    if hm:
+        return f"hnv{hm.group(1)}"
+
+    n = re.sub(r"[/\\]+", " ", n)
+    n = re.sub(r"[_]+", " ", n)
+    n = re.sub(r"[^\w\s\-]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    n = re.sub(r"\s+\d{6,}\s*$", "", n)
+    return n
+
+
 def _normalize_supplier_name(name: str) -> str:
-    """Strip common suffixes and noise for better fuzzy comparison."""
-    n = name.strip().lower()
-    for suffix in [" gmbh & co. kg", " gmbh & co.kg", " gmbh & co kg",
-                   " gmbh & co", " gmbh", " ag", " kg", " ohg", " e.k.",
-                   " e.k", " mbh", " ug", " se", " co.", " inc.", " ltd.",
-                   " corp.", " s.a.", " s.r.l."]:
+    """Strip legal suffixes; used as secondary signal with match key."""
+    n = _german_ascii_fold(str(name))
+    for suffix in _LEGAL_SUFFIXES:
         if n.endswith(suffix):
             n = n[: -len(suffix)].strip()
     n = re.sub(r"[,./&\-]+$", "", n).strip()
@@ -575,33 +645,101 @@ def _normalize_supplier_name(name: str) -> str:
     return n
 
 
-def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, str]:
-    """Map similar supplier names to a canonical (longest) form."""
-    sorted_names = sorted(names, key=lambda x: -len(str(x)))
-    mapping: dict[str, str] = {}
-    norm_cache: dict[str, str] = {n: _normalize_supplier_name(n) for n in sorted_names}
+def _name_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    ra = SequenceMatcher(None, a, b).ratio()
+    rb = 0.0
+    la, lb = len(a), len(b)
+    shorter, longer = (a, b) if la <= lb else (b, a)
+    if len(shorter) >= 4 and len(longer) >= 4:
+        if longer.startswith(shorter) or longer.endswith(" " + shorter):
+            rb = max(rb, 0.92)
+    tokens_a = set(a.split())
+    tokens_b = set(b.split())
+    if tokens_a and tokens_b:
+        inter = len(tokens_a & tokens_b)
+        union = len(tokens_a | tokens_b)
+        if union > 0:
+            rb = max(rb, inter / union)
+    return max(ra, rb)
 
-    for name in sorted_names:
-        if name in mapping:
-            continue
-        mapping[name] = name
-        norm_a = norm_cache[name]
-        for other in sorted_names:
-            if other == name or other in mapping:
+
+def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, str]:
+    """Map similar supplier names to one canonical display name (longest original)."""
+    raw = sorted({str(n).strip() for n in names if str(n).strip() and str(n).lower() not in ("nan", "unknown")})
+    if len(raw) <= 1:
+        return {n: n for n in raw}
+
+    key_for: dict[str, str] = {}
+    buckets: dict[str, list[str]] = {}
+    for name in raw:
+        k = _supplier_match_key(name)
+        if not k:
+            k = _normalize_supplier_name(name) or name.lower()
+        key_for[name] = k
+        buckets.setdefault(k, []).append(name)
+
+    def canonical_for_bucket(members: list[str]) -> str:
+        return max(members, key=lambda x: (len(x), x))
+
+    key_canon: dict[str, str] = {k: canonical_for_bucket(v) for k, v in buckets.items()}
+    keys = list(key_canon.keys())
+
+    parent = {k: k for k in keys}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: str, y: str) -> None:
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+
+    def _structured_keys_distinct(a: str, b: str) -> bool:
+        """Do not fuzzy-merge different booking accounts (Skontoabzug / HN-V IDs)."""
+        if re.match(r"^skontoabzug \d+$", a) and re.match(r"^skontoabzug \d+$", b):
+            return a != b
+        if re.match(r"^hnv\d+$", a) and re.match(r"^hnv\d+$", b):
+            return a != b
+        return False
+
+    short_thr = max(0.72, threshold - 0.08)
+    for i, ka in enumerate(keys):
+        for kb in keys[i + 1 :]:
+            if ka == kb:
                 continue
-            norm_b = norm_cache[other]
-            if norm_a == norm_b:
-                mapping[other] = name
+            if _structured_keys_distinct(ka, kb):
                 continue
-            if len(norm_a) < 3 or len(norm_b) < 3:
+            ca, cb = key_canon[ka], key_canon[kb]
+            sim_key = _name_similarity(ka, kb)
+            sim_norm = _name_similarity(
+                _normalize_supplier_name(ca), _normalize_supplier_name(cb)
+            )
+            min_len = min(len(ka), len(kb))
+            thr = short_thr if min_len <= 12 else threshold
+            if sim_key >= thr or sim_norm >= thr:
+                union(ka, kb)
                 continue
-            ratio = SequenceMatcher(None, norm_a, norm_b).ratio()
-            if ratio >= threshold:
-                mapping[other] = name
-                continue
-            if len(norm_a) > 4 and len(norm_b) > 4:
-                if norm_a.startswith(norm_b) or norm_b.startswith(norm_a):
-                    mapping[other] = name
+            if min_len >= 5 and (ka.startswith(kb + " ") or kb.startswith(ka + " ")):
+                union(ka, kb)
+
+    root_members: dict[str, list[str]] = {}
+    for k in keys:
+        r = find(k)
+        root_members.setdefault(r, []).extend(buckets[k])
+
+    mapping: dict[str, str] = {}
+    for _root, members in root_members.items():
+        canon = canonical_for_bucket(list(dict.fromkeys(members)))
+        for m in members:
+            mapping[m] = canon
+
     return mapping
 
 
