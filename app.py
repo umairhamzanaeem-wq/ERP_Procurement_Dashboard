@@ -150,11 +150,21 @@ def _to_numeric_safe(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
 
 
+def _first_row_has_type_descriptors(df: pd.DataFrame) -> bool:
+    """True if row 0 looks like Excel type-metadata (VarChar, Int, …)."""
+    for val in df.iloc[0].values:
+        vs = str(val).lower().strip()
+        if vs in ("nan", "<na>", "nat", "none", ""):
+            continue
+        if any(kw in vs for kw in _TYPE_DESCRIPTOR_KEYWORDS):
+            return True
+    return False
+
+
 def _drop_descriptor_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    first = df.iloc[0].astype(str).str.lower().str.strip()
-    if not first.apply(lambda v: any(kw in v for kw in _TYPE_DESCRIPTOR_KEYWORDS)).any():
+    if not _first_row_has_type_descriptors(df):
         return df
     rename_map: dict[str, str] = {}
     for col in df.columns:
