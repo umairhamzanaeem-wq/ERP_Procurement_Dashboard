@@ -861,6 +861,34 @@ def process_file(uploaded) -> dict:
             "suppliers": suppliers, "pivots": pivots, "sheet_info": sheet_info}
 
 
+def _agg_join_unique_strings(series: pd.Series) -> str:
+    """Join unique non-empty string values in a group (Arrow/pd.NA safe)."""
+    seen: set[str] = set()
+    for val in series:
+        if pd.isna(val):
+            continue
+        s = str(val).strip()
+        if not s or s.lower() == "nan":
+            continue
+        seen.add(s)
+    return ", ".join(sorted(seen))
+
+
+def _agg_join_months(series: pd.Series) -> str:
+    seen: set[str] = set()
+    for val in series:
+        if pd.isna(val):
+            continue
+        s = str(val).strip()
+        if not s or s in ("N/A", "nan"):
+            continue
+        for part in s.split(","):
+            p = part.strip()
+            if p and p not in ("N/A", "nan"):
+                seen.add(p)
+    return ", ".join(sorted(seen))
+
+
 def _aggregate_by_supplier(df: pd.DataFrame) -> pd.DataFrame:
     """Consolidate transactions into one row per supplier with summed amounts."""
     if df.empty or C_SUPPLIER_NAME not in df.columns:
@@ -885,17 +913,17 @@ def _aggregate_by_supplier(df: pd.DataFrame) -> pd.DataFrame:
     if C_SUPPLIER_ID in df.columns:
         extra_agg[C_SUPPLIER_ID] = "first"
     if C_GL_ACCOUNT in df.columns:
-        non_empty = df[C_GL_ACCOUNT].astype(str).str.strip()
-        if (non_empty != "").any():
-            extra_agg[C_GL_ACCOUNT] = lambda x: ", ".join(sorted(set(v for v in x.astype(str).str.strip() if v and v != "nan")))
+        gl = df[C_GL_ACCOUNT].map(lambda v: str(v).strip() if pd.notna(v) else "")
+        if (gl != "").any():
+            extra_agg[C_GL_ACCOUNT] = _agg_join_unique_strings
     if C_COST_CENTER in df.columns:
-        non_empty = df[C_COST_CENTER].astype(str).str.strip()
-        if (non_empty != "").any():
-            extra_agg[C_COST_CENTER] = lambda x: ", ".join(sorted(set(v for v in x.astype(str).str.strip() if v and v != "nan")))
+        cc = df[C_COST_CENTER].map(lambda v: str(v).strip() if pd.notna(v) else "")
+        if (cc != "").any():
+            extra_agg[C_COST_CENTER] = _agg_join_unique_strings
     if C_COMPANY in df.columns:
         extra_agg[C_COMPANY] = "first"
     if "Month" in df.columns:
-        extra_agg["Month"] = lambda x: ", ".join(sorted(set(str(v) for v in x if str(v) != "N/A" and str(v) != "nan")))
+        extra_agg["Month"] = _agg_join_months
 
     agg_dict.update(extra_agg)
 
