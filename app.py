@@ -1,13 +1,18 @@
 import io
+import json
+import logging
+import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 C_SOURCE = "Source"
 C_DATE = "Date"
@@ -60,7 +65,8 @@ _COLUMN_SIGNATURES: dict[str, list[str]] = {
         "summe", "amount", "betrag", "netto", "net", "gesamtbetrag",
         "total", "wert", "value", "brutto", "gross", "rechnungsbetrag",
         "invoice amount", "umsatz", "turnover", "nettobetrag", "bruttobetrag",
-        "endbetrag", "gesamt",
+        "endbetrag", "gesamt", "amt", "total amount", "amount total",
+        "invoice total", "line total", "net amount", "gross amount",
     ],
     C_DESCRIPTION: [
         "beschreibung", "description", "text", "buchungstext", "bemerkung",
@@ -97,17 +103,61 @@ _MONTH_NAMES_DE = {
     "dezember": 12, "dez": 12,
 }
 
+_REFERENCE_EXTRA: dict[str, list[str]] = {}
+_REFERENCE_LOADED = False
+
+_XLSX_ROW_WARN = 200_000
+
+# Merge supplier labels when fuzzy similarity ≥ this (88% = 0.88); debit/credit then sum per merged name.
+FUZZY_SUPPLIER_MERGE_THRESHOLD = 0.88
+
+
+def _load_reference_schema_aliases() -> None:
+    """Optional reference_schema.json next to app.py: { \"Amount\": [\"Amt\", ...], ... }."""
+    global _REFERENCE_LOADED, _REFERENCE_EXTRA
+    if _REFERENCE_LOADED:
+        return
+    _REFERENCE_LOADED = True
+    base = os.path.dirname(os.path.abspath(__file__))
+    for fname in ("reference_schema.json", "REFERENCE_SCHEMA.json"):
+        path = os.path.join(base, fname)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            for key, vals in data.items():
+                if key not in _COLUMN_SIGNATURES or not isinstance(vals, (list, tuple)):
+                    continue
+                _REFERENCE_EXTRA[key] = [str(v).strip().lower() for v in vals if str(v).strip()]
+            logger.info("Loaded reference column aliases from %s", fname)
+            break
+        except Exception as e:
+            logger.warning("Could not load %s: %s", path, e)
+
+
+def _patterns_for_column(canonical: str) -> list[str]:
+    _load_reference_schema_aliases()
+    base = list(_COLUMN_SIGNATURES.get(canonical, []))
+    base.extend(_REFERENCE_EXTRA.get(canonical, []))
+    return base
+
 
 def _best_column_match(raw_col: str) -> Optional[str]:
     normed = raw_col.strip().lower().replace("_", " ").replace("-", " ")
-    for canonical, patterns in _COLUMN_SIGNATURES.items():
+    for canonical in _COLUMN_SIGNATURES:
+        patterns = _patterns_for_column(canonical)
         if normed in patterns:
             return canonical
-    for canonical, patterns in _COLUMN_SIGNATURES.items():
+    for canonical in _COLUMN_SIGNATURES:
+        patterns = _patterns_for_column(canonical)
         for pat in patterns:
             if pat in normed or normed in pat:
                 return canonical
-    for canonical, patterns in _COLUMN_SIGNATURES.items():
+    for canonical in _COLUMN_SIGNATURES:
+        patterns = _patterns_for_column(canonical)
         for pat in patterns:
             if SequenceMatcher(None, normed, pat).ratio() >= 0.85 and len(normed) > 3:
                 return canonical
@@ -137,17 +187,72 @@ def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _parse_numeric_scalar(val: Any) -> float:
+    """Parse one cell: DE-style 1.234,56, US 1,234.56, plain floats, accounting (1.234)."""
+    if val is None:
+        return float("nan")
+    if isinstance(val, bool):
+        return float("nan")
+    if isinstance(val, (int,)):
+        return float(val)
+    if isinstance(val, float):
+        return float("nan") if pd.isna(val) else float(val)
+
+    s = str(val).strip()
+    for sym in ("\u20ac", "$", "\u00a3", "%"):
+        s = s.replace(sym, "")
+    s = s.replace("\xa0", " ").replace(" ", "").replace("'", "")
+    if not s or s.lower() in ("nan", "none", "-", "—", "n/a"):
+        return float("nan")
+
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+    if s.endswith("-"):
+        neg = not neg
+        s = s[:-1].strip()
+    if not s:
+        return float("nan")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        if s.count(",") == 1 and re.search(r",\d{1,6}$", s):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif s.count(".") > 1:
+        parts = s.split(".")
+        s = "".join(parts[:-1]) + "." + parts[-1]
+
+    try:
+        v = float(s)
+        return -v if neg else v
+    except ValueError:
+        return float("nan")
+
+
 def _to_numeric_safe(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").fillna(0.0)
+
+    raw = series.astype(str)
     cleaned = (
-        series.astype(str)
-        .str.replace("\u20ac", "", regex=False)
+        raw.str.replace("\u20ac", "", regex=False)
         .str.replace("$", "", regex=False)
         .str.replace(",", ".", regex=False)
         .str.replace(" ", "", regex=False)
         .str.replace("\xa0", "", regex=False)
         .str.strip()
     )
-    return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
+    fast = pd.to_numeric(cleaned, errors="coerce")
+    slow = series.map(_parse_numeric_scalar)
+    merged = fast.where(fast.notna(), slow)
+    return merged.fillna(0.0)
 
 
 def _first_row_has_type_descriptors(df: pd.DataFrame) -> bool:
@@ -180,52 +285,260 @@ def _drop_descriptor_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def _safe_sort_filter_options(values: list[Any]) -> list[Any]:
+    """Sort unique filter values; Excel columns may mix int/float/str."""
+    try:
+        return sorted(values)
+    except TypeError:
+        return sorted(values, key=lambda x: (type(x).__name__, str(x).casefold()))
+
+
+def clean_dataframe(df: pd.DataFrame, drop_dup_rows: bool = True) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
     df = df.loc[:, ~df.columns.duplicated()]
-    df = df.drop_duplicates().reset_index(drop=True)
-    for col in df.select_dtypes(include="object").columns:
+    if drop_dup_rows and len(df) <= 25_000:
+        df = df.drop_duplicates().reset_index(drop=True)
+    for col in df.columns:
         try:
-            df[col] = df[col].str.strip()
-        except (AttributeError, TypeError):
+            df[col] = df[col].map(lambda x: x.strip() if isinstance(x, str) else x)
+        except (AttributeError, TypeError, ValueError):
             pass
     return df
 
 
-def _detect_header_row(df_raw: pd.DataFrame, max_scan: int = 10) -> int:
+def _cell_str_lower(val: Any) -> str:
+    if pd.isna(val):
+        return ""
+    s = str(val).strip().lower()
+    if s in ("nan", "<na>", "nat", "none"):
+        return ""
+    return s
+
+
+def _normalize_header_label(name: Any, col_index: int) -> str:
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return f"column_{col_index}"
+    s = str(name).strip()
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    if not s or s.lower() == "nan":
+        return f"column_{col_index}"
+    slug = re.sub(r"[^\w\s\-\./&]", "_", s, flags=re.UNICODE)
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    return slug or f"column_{col_index}"
+
+
+def _sanitize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.copy()
+    new_cols: list[str] = []
+    seen: dict[str, int] = {}
+    for i, c in enumerate(df.columns):
+        base = _normalize_header_label(c, i)
+        key = base.lower()
+        cnt = seen.get(key, 0)
+        seen[key] = cnt + 1
+        col_name = base if cnt == 0 else f"{base}_{cnt}"
+        new_cols.append(col_name)
+    df.columns = new_cols
+    return df
+
+
+def _maybe_fill_merged_first_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or df.shape[1] < 1 or len(df) > 150_000:
+        return df
+    c0 = df.iloc[:, 0]
+    try:
+        null_ratio = float(c0.isna().mean())
+    except Exception:
+        return df
+    if null_ratio < 0.12:
+        return df
+    try:
+        sample = c0.dropna().head(20)
+        if sample.empty:
+            return df
+        if pd.to_numeric(sample, errors="coerce").notna().mean() > 0.7:
+            return df
+    except Exception:
+        pass
+    out = df.copy()
+    try:
+        out.iloc[:, 0] = c0.ffill()
+    except Exception:
+        return df
+    return out
+
+
+def _detect_header_row(df_raw: pd.DataFrame, max_scan: int = 15) -> int:
     best_row, best_score = 0, 0
-    for i in range(min(max_scan, len(df_raw))):
-        row_vals = df_raw.iloc[i].astype(str).str.strip().str.lower()
-        non_empty = row_vals[row_vals != ""].dropna()
-        if len(non_empty) < 2:
-            continue
+    n = min(max_scan, len(df_raw))
+    ncols = df_raw.shape[1]
+    for i in range(n):
         score = 0
-        for v in non_empty:
-            if _best_column_match(v):
+        nonempty = 0
+        for j in range(ncols):
+            vs = _cell_str_lower(df_raw.iat[i, j])
+            if not vs:
+                continue
+            nonempty += 1
+            if _best_column_match(vs):
                 score += 3
-            elif len(v) > 1 and not v.replace(".", "").replace(",", "").replace("-", "").isdigit():
+            elif len(vs) > 1 and not vs.replace(".", "").replace(",", "").replace("-", "").isdigit():
                 score += 1
+        if nonempty < 2:
+            continue
         if score > best_score:
             best_score = score
             best_row = i
     return best_row
 
 
-def _read_sheet_smart(raw_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+def _excel_engines_for_read(filename: str) -> list[str]:
+    """Prefer the right engine: .xls needs xlrd; .xlsx / .xlsm use openpyxl."""
+    lower = (filename or "").lower()
+    if lower.endswith(".xls") and not lower.endswith(".xlsx"):
+        try:
+            import xlrd  # noqa: F401
+
+            return ["xlrd"]
+        except ImportError:
+            logger.warning("Install xlrd for .xls files: pip install xlrd")
+            return ["openpyxl"]
+    if lower.endswith((".xlsx", ".xlsm", ".xltx", ".xltm")):
+        return ["openpyxl"]
+    engines = ["openpyxl"]
     try:
-        df_peek = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name, header=None, nrows=15)
-    except Exception:
-        return pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name)
-    header_row = _detect_header_row(df_peek)
-    df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name, header=header_row)
-    unnamed = [c for c in df.columns if str(c).startswith("Unnamed")]
-    if len(unnamed) > len(df.columns) * 0.7 and header_row == 0:
-        for try_row in range(1, min(6, len(df))):
-            row_vals = df.iloc[try_row - 1].astype(str).str.lower()
-            if sum(1 for v in row_vals if _best_column_match(v)) >= 2:
-                df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name, header=try_row)
-                break
-    return df
+        import xlrd  # noqa: F401
+
+        engines.append("xlrd")
+    except ImportError:
+        pass
+    return engines
+
+
+def _read_excel_kw_variants(filename: str) -> list[dict[str, Any]]:
+    variants: list[dict[str, Any]] = []
+    for eng in _excel_engines_for_read(filename):
+        variants.append({"engine": eng, "dtype": object})
+        variants.append({"engine": eng})
+    variants.append({"dtype": object})
+    variants.append({})
+    return variants
+
+
+def _open_excel_file(raw_bytes: bytes, filename: str) -> pd.ExcelFile:
+    bio = io.BytesIO(raw_bytes)
+    last_err: Optional[Exception] = None
+    for eng in _excel_engines_for_read(filename):
+        try:
+            bio.seek(0)
+            return pd.ExcelFile(bio, engine=eng)
+        except Exception as e:
+            last_err = e
+            logger.debug("ExcelFile engine=%s failed: %s", eng, e)
+            bio = io.BytesIO(raw_bytes)
+    try:
+        bio.seek(0)
+        return pd.ExcelFile(bio)
+    except Exception as e:
+        if last_err:
+            raise last_err from e
+        raise e
+
+
+def _read_sheet_smart(raw_bytes: bytes, sheet_name: str, filename: str = "") -> pd.DataFrame:
+    return _read_excel_sheet_robust(raw_bytes, sheet_name, filename)
+
+
+def _read_excel_sheet_robust(raw_bytes: bytes, sheet_name: str, filename: str = "") -> pd.DataFrame:
+    bio = io.BytesIO(raw_bytes)
+    last_err: Optional[Exception] = None
+    for extra in _read_excel_kw_variants(filename):
+        try:
+            bio.seek(0)
+            df_peek = pd.read_excel(
+                bio, sheet_name=sheet_name, header=None, nrows=25, **extra
+            )
+            header_row = _detect_header_row(df_peek)
+            bio.seek(0)
+            df = pd.read_excel(bio, sheet_name=sheet_name, header=header_row, **extra)
+            if len(df) > _XLSX_ROW_WARN:
+                logger.warning(
+                    "Sheet %r is large (%s rows); processing may be slow.",
+                    sheet_name,
+                    len(df),
+                )
+            df = _sanitize_dataframe_columns(df)
+            df = _maybe_fill_merged_first_column(df)
+            unnamed = sum(
+                1
+                for c in df.columns
+                if str(c).lower().startswith(("unnamed", "column_"))
+            )
+            if (
+                len(df.columns) > 0
+                and unnamed > len(df.columns) * 0.65
+                and header_row == 0
+                and len(df) > 0
+            ):
+                for try_row in range(1, min(8, len(df))):
+                    hits = 0
+                    for j in range(min(df.shape[1], 40)):
+                        vs = _cell_str_lower(df.iat[try_row - 1, j])
+                        if vs and _best_column_match(vs):
+                            hits += 1
+                    if hits >= 2:
+                        bio.seek(0)
+                        df = pd.read_excel(bio, sheet_name=sheet_name, header=try_row, **extra)
+                        df = _sanitize_dataframe_columns(df)
+                        df = _maybe_fill_merged_first_column(df)
+                        break
+            return df
+        except Exception as e:
+            last_err = e
+            continue
+    logger.warning("Could not read sheet %r: %s", sheet_name, last_err)
+    return pd.DataFrame()
+
+
+def _iter_excel_sheet_names(raw_bytes: bytes, xls: pd.ExcelFile) -> list[str]:
+    names: list[str] = []
+    try:
+        from openpyxl import load_workbook
+
+        wb = load_workbook(
+            io.BytesIO(raw_bytes),
+            read_only=True,
+            data_only=True,
+            keep_links=False,
+        )
+        try:
+            names = list(wb.sheetnames)
+        finally:
+            wb.close()
+    except Exception as e:
+        logger.debug("openpyxl sheet enumeration: %s", e)
+    if not names:
+        return list(xls.sheet_names)
+    for s in xls.sheet_names:
+        if s not in names:
+            names.append(s)
+    return names
+
+
+def _read_excel_no_header(raw_bytes: bytes, sheet_name: str, filename: str = "") -> pd.DataFrame:
+    """Raw grid (integer columns); used where parsers select columns by index."""
+    bio = io.BytesIO(raw_bytes)
+    for extra in _read_excel_kw_variants(filename):
+        try:
+            bio.seek(0)
+            return pd.read_excel(bio, sheet_name=sheet_name, header=None, **extra)
+        except Exception:
+            continue
+    return pd.DataFrame()
 
 
 def _classify_sheet(sheet_name: str, df: pd.DataFrame) -> str:
@@ -267,14 +580,9 @@ def _detect_numeric_columns(df: pd.DataFrame) -> list[str]:
                 result.append(str(col))
             continue
         try:
-            cleaned = (df[col].astype(str)
-                       .str.replace("\u20ac", "", regex=False)
-                       .str.replace("$", "", regex=False)
-                       .str.replace(",", ".", regex=False)
-                       .str.replace(" ", "", regex=False)
-                       .str.replace("\xa0", "", regex=False).str.strip())
-            converted = pd.to_numeric(cleaned, errors="coerce")
-            if converted.notna().sum() / max(len(df), 1) > 0.3 and converted.abs().sum() > 0:
+            parsed = df[col].map(_parse_numeric_scalar)
+            rate = parsed.notna().sum() / max(len(df), 1)
+            if rate > 0.3 and parsed.fillna(0.0).abs().sum() > 0:
                 result.append(str(col))
         except Exception:
             pass
@@ -345,7 +653,7 @@ def _extract_year_from_filename(filename: str) -> int:
 def _parse_transactions(df: pd.DataFrame, filename: str = "") -> pd.DataFrame:
     df = _drop_descriptor_rows(df.copy())
     df = _map_columns(df)
-    df = clean_dataframe(df)
+    df = clean_dataframe(df, drop_dup_rows=False)
     if df.empty:
         return pd.DataFrame()
     for col in df.select_dtypes(include="object").columns:
@@ -416,7 +724,7 @@ def _parse_transactions(df: pd.DataFrame, filename: str = "") -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
-def _parse_suppliers(df_raw: pd.DataFrame, raw_bytes: bytes, sheet_name: str) -> pd.DataFrame:
+def _parse_suppliers(df_raw: pd.DataFrame, raw_bytes: bytes, sheet_name: str, filename: str = "") -> pd.DataFrame:
     first_col = str(list(df_raw.columns)[0]).lower()
     if "kreditorenstammdaten" in first_col or "rechnungswesen" in first_col:
         header_row = df_raw.iloc[0]
@@ -453,9 +761,8 @@ def _parse_suppliers(df_raw: pd.DataFrame, raw_bytes: bytes, sheet_name: str) ->
     has_real = any(set(c.replace("-", " ").replace("_", " ").split()) & hdr_kw for c in str_cols if not c.startswith("unnamed"))
 
     if all_unnamed or not has_real:
-        try:
-            df_nh = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name, header=None)
-        except Exception:
+        df_nh = _read_excel_no_header(raw_bytes, sheet_name, filename)
+        if df_nh.empty:
             df_nh = df_raw.copy()
             df_nh.columns = range(len(df_nh.columns))
         id_col_idx, name_col_idx, company_col_idx = None, None, None
@@ -530,7 +837,7 @@ def _parse_pivot(df: pd.DataFrame) -> pd.DataFrame:
 def _parse_generic(df: pd.DataFrame, filename: str = "") -> pd.DataFrame:
     df = _map_columns(df.copy())
     df = _drop_descriptor_rows(df)
-    df = clean_dataframe(df)
+    df = clean_dataframe(df, drop_dup_rows=False)
     if df.empty or len(df.columns) < 2:
         return pd.DataFrame()
     nc = _detect_numeric_columns(df)
@@ -581,9 +888,17 @@ _INVOICE_SUFFIXES = (
 _LEGAL_SUFFIXES = (
     " gmbh & co. kg", " gmbh & co.kg", " gmbh & co kg",
     " gmbh & co", " gmbh", " ag", " kg", " ohg", " e.k.",
-    " e.k", " mbh", " ug", " se", " co.", " inc.", " ltd.",
+    " e.k", " mbh", " ug", " se", " eg", " co.", " inc.", " ltd.",
     " corp.", " s.a.", " s.r.l.",
 )
+
+# Hyphen, en dash, em dash — after "621114 - Supplier GmbH" style labels
+_KONTO_PREFIX_RE = re.compile(r"^\d{5,12}\s*[\u002d\u2013\u2014]\s*")
+
+
+def _strip_leading_konto_prefix(n: str) -> str:
+    """Drop leading Konto/Kreditor number + dash so '608238 - Firma' and '621114 - Firma' share one key."""
+    return _KONTO_PREFIX_RE.sub("", n, count=1)
 
 
 def _german_ascii_fold(s: str) -> str:
@@ -605,11 +920,33 @@ def _german_ascii_fold(s: str) -> str:
     return s
 
 
+def _skonto_konto_from_label(n: str) -> Optional[re.Match]:
+    """Match 'Skontoabzug 80076 / …' style lines; same Konto → one merge key."""
+    return re.match(r"^(skontoabzug)\s+(\d{4,8})\b", n.strip())
+
+
+def _canonical_supplier_label_for_key(match_key: str, members: list[str]) -> str:
+    """Prefer short Skontoabzug <Konto> labels; else longest original name."""
+    if match_key and re.fullmatch(r"skontoabzug \d{4,8}", match_key):
+        num = match_key.split()[-1]
+        return f"Skontoabzug {num}"
+    if not members:
+        return "Unknown"
+    return max(members, key=lambda x: (len(str(x)), str(x)))
+
+
 def _supplier_match_key(name: str) -> str:
     """Stable key for grouping: strips booking refs, Skontoabzug line IDs, invoice tails."""
     if not name or str(name).strip().lower() in ("", "nan", "unknown", "none"):
         return ""
     n = _german_ascii_fold(str(name))
+    n = re.sub(r"\s*,\s*", " ", n)
+    n = re.sub(r"\s+eg\s+", " ", n)
+    n = _strip_leading_konto_prefix(n)
+
+    sk0 = _skonto_konto_from_label(n)
+    if sk0:
+        return f"{sk0.group(1)} {sk0.group(2)}"
 
     for suf in _LEGAL_SUFFIXES:
         if n.endswith(suf):
@@ -628,7 +965,7 @@ def _supplier_match_key(name: str) -> str:
     n = re.sub(r"\s+/\s*\d[\d\s]*$", "", n)
     n = re.sub(r"\s+/\s*\d+$", "", n)
 
-    sk = re.match(r"^(skontoabzug)\s+(\d+)\s*$", n)
+    sk = _skonto_konto_from_label(n)
     if sk:
         return f"{sk.group(1)} {sk.group(2)}"
 
@@ -667,6 +1004,9 @@ def _name_similarity(a: str, b: str) -> float:
     if len(shorter) >= 4 and len(longer) >= 4:
         if longer.startswith(shorter) or longer.endswith(" " + shorter):
             rb = max(rb, 0.92)
+    if len(shorter) >= 6 and len(longer) >= len(shorter) + 2:
+        if re.search(r"(^|\s)" + re.escape(shorter) + r"(\s|$)", longer):
+            rb = max(rb, 0.91)
     tokens_a = set(a.split())
     tokens_b = set(b.split())
     if tokens_a and tokens_b:
@@ -674,11 +1014,59 @@ def _name_similarity(a: str, b: str) -> float:
         union = len(tokens_a | tokens_b)
         if union > 0:
             rb = max(rb, inter / union)
+        if len(shorter) >= 5:
+            if shorter in tokens_a and shorter in tokens_b:
+                rb = max(rb, 0.93)
+            elif shorter in tokens_a or shorter in tokens_b:
+                longer_tokens = tokens_b if shorter in tokens_a else tokens_a
+                for t in longer_tokens:
+                    if len(t) >= len(shorter) and t != shorter and shorter in t and len(shorter) >= 6:
+                        rb = max(rb, 0.90)
+                        break
     return max(ra, rb)
 
 
-def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, str]:
-    """Map similar supplier names to one canonical display name (longest original)."""
+def _collapse_names_by_match_key(names: list[str]) -> dict[str, str]:
+    """Map each raw supplier label to one canonical name per _supplier_match_key bucket (longest wins)."""
+    raw = sorted(
+        {
+            str(n).strip()
+            for n in names
+            if str(n).strip() and str(n).lower() not in ("nan", "unknown", "none")
+        }
+    )
+    if not raw:
+        return {}
+    buckets: dict[str, list[str]] = {}
+    for name in raw:
+        k = _supplier_match_key(name)
+        if not k:
+            k = _normalize_supplier_name(name) or name.lower()
+        buckets.setdefault(k, []).append(name)
+
+    mapping: dict[str, str] = {}
+    for k, members in buckets.items():
+        canon = _canonical_supplier_label_for_key(k, members)
+        for m in members:
+            mapping[m] = canon
+    return mapping
+
+
+def _series_apply_name_map(ser: pd.Series, mapping: dict[str, str]) -> pd.Series:
+    """Apply supplier rename dict; keep original where key missing (vectorized)."""
+    if not mapping:
+        return ser
+    s = ser.fillna("Unknown").astype(str).str.strip()
+    hit = s.map(mapping)
+    return hit.combine_first(s)
+
+
+def _fuzzy_group_names(names: list[str], threshold: float = FUZZY_SUPPLIER_MERGE_THRESHOLD) -> dict[str, str]:
+    """Map similar supplier names to one canonical display name (longest original).
+
+    Pairs of internal match-keys must reach ``threshold`` (default 88%) similarity to merge;
+    all rows under merged names roll up into one line when amounts are aggregated.
+    """
     raw = sorted({str(n).strip() for n in names if str(n).strip() and str(n).lower() not in ("nan", "unknown")})
     if len(raw) <= 1:
         return {n: n for n in raw}
@@ -692,11 +1080,26 @@ def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, s
         key_for[name] = k
         buckets.setdefault(k, []).append(name)
 
-    def canonical_for_bucket(members: list[str]) -> str:
-        return max(members, key=lambda x: (len(x), x))
+    def canonical_for_bucket_key(k: str, members: list[str]) -> str:
+        return _canonical_supplier_label_for_key(k, members)
 
-    key_canon: dict[str, str] = {k: canonical_for_bucket(v) for k, v in buckets.items()}
+    key_canon: dict[str, str] = {
+        k: canonical_for_bucket_key(k, v) for k, v in buckets.items()
+    }
     keys = list(key_canon.keys())
+
+    _FUZZY_KEY_CAP = 700
+    if len(keys) > _FUZZY_KEY_CAP:
+        logger.info(
+            "Skipping cross-bucket fuzzy merge (%s match-keys); using per-bucket names only.",
+            len(keys),
+        )
+        mapping: dict[str, str] = {}
+        for k, members in buckets.items():
+            canon = canonical_for_bucket_key(k, members)
+            for m in members:
+                mapping[m] = canon
+        return mapping
 
     parent = {k: k for k in keys}
 
@@ -719,7 +1122,7 @@ def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, s
             return a != b
         return False
 
-    short_thr = max(0.72, threshold - 0.08)
+    short_thr = max(0.75, threshold - 0.10)
     for i, ka in enumerate(keys):
         for kb in keys[i + 1 :]:
             if ka == kb:
@@ -746,7 +1149,11 @@ def _fuzzy_group_names(names: list[str], threshold: float = 0.82) -> dict[str, s
 
     mapping: dict[str, str] = {}
     for _root, members in root_members.items():
-        canon = canonical_for_bucket(list(dict.fromkeys(members)))
+        uniq = list(dict.fromkeys(members))
+        roots = {_supplier_match_key(m) or _normalize_supplier_name(m) or m.lower() for m in uniq}
+        roots.discard("")
+        rk = next(iter(roots)) if len(roots) == 1 else ""
+        canon = _canonical_supplier_label_for_key(rk, uniq) if rk else max(uniq, key=lambda x: (len(x), x))
         for m in members:
             mapping[m] = canon
 
@@ -783,6 +1190,7 @@ def _extract_company_from_filename(filename: str) -> str:
 
 
 def process_file(uploaded) -> dict:
+    _load_reference_schema_aliases()
     raw_bytes = uploaded.getvalue()
     filename = uploaded.name
     company_label = _extract_company_from_filename(filename)
@@ -793,64 +1201,106 @@ def process_file(uploaded) -> dict:
     is_csv = filename.lower().endswith(".csv")
 
     if is_csv:
-        try:
-            df_raw = pd.read_csv(io.BytesIO(raw_bytes), encoding="utf-8", sep=None, engine="python")
-        except Exception:
+        df_raw = pd.DataFrame()
+        for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
             try:
-                df_raw = pd.read_csv(io.BytesIO(raw_bytes), encoding="latin-1", sep=None, engine="python")
+                df_raw = pd.read_csv(
+                    io.BytesIO(raw_bytes),
+                    encoding=enc,
+                    sep=None,
+                    engine="python",
+                    on_bad_lines="skip",
+                )
+                break
+            except TypeError:
+                try:
+                    df_raw = pd.read_csv(
+                        io.BytesIO(raw_bytes), encoding=enc, sep=None, engine="python"
+                    )
+                    break
+                except Exception:
+                    continue
             except Exception:
-                df_raw = pd.DataFrame()
+                continue
         if not df_raw.empty:
+            try:
+                df_raw = _sanitize_dataframe_columns(df_raw)
+            except Exception as e:
+                logger.warning("CSV column sanitize skipped: %s", e)
             classification = _classify_sheet("data", df_raw)
             sheet_info.append({"sheet": "CSV Data", "type": classification, "rows": len(df_raw), "cols": len(df_raw.columns)})
-            parsed = _parse_transactions(df_raw, filename)
-            if not parsed.empty:
-                parsed[C_SOURCE] = company_label
-                all_transactions.append(parsed)
+            try:
+                parsed = _parse_transactions(df_raw, filename)
+                if not parsed.empty:
+                    parsed[C_SOURCE] = company_label
+                    all_transactions.append(parsed)
+            except Exception as e:
+                logger.warning("CSV parse failed for %s: %s", filename, e)
+                sheet_info[-1]["note"] = str(e)
     else:
         try:
-            xls = pd.ExcelFile(io.BytesIO(raw_bytes))
-        except Exception:
+            xls = _open_excel_file(raw_bytes, filename)
+        except Exception as e:
+            logger.warning("ExcelFile open failed for %s: %s", filename, e)
+            hint = ""
+            if "encrypted" in str(e).lower() or "password" in str(e).lower():
+                hint = " (Workbook may be password-protected — remove protection in Excel and save.)"
+            elif filename.lower().endswith(".xls") and "xlrd" not in str(e).lower():
+                hint = " For .xls install: pip install xlrd"
             return {"filename": filename, "company": company_label, "transactions": pd.DataFrame(),
                     "suppliers": pd.DataFrame(), "pivots": pd.DataFrame(),
-                    "sheet_info": [{"sheet": "ERROR", "type": "unreadable", "rows": 0, "cols": 0}]}
-        for sheet_name in xls.sheet_names:
+                    "sheet_info": [{"sheet": "ERROR", "type": "unreadable", "rows": 0, "cols": 0,
+                                    "note": str(e) + hint}]}
+        for sheet_name in _iter_excel_sheet_names(raw_bytes, xls):
             try:
-                df_raw = _read_sheet_smart(raw_bytes, sheet_name)
-            except Exception:
-                try:
-                    df_raw = pd.read_excel(xls, sheet_name=sheet_name)
-                except Exception:
-                    sheet_info.append({"sheet": sheet_name, "type": "unreadable", "rows": 0, "cols": 0})
-                    continue
-            classification = _classify_sheet(sheet_name, df_raw)
+                df_raw = _read_excel_sheet_robust(raw_bytes, sheet_name, filename)
+            except Exception as e:
+                logger.warning("Sheet %r read failed (%s): %s", sheet_name, filename, e)
+                sheet_info.append({
+                    "sheet": sheet_name, "type": "unreadable", "rows": 0, "cols": 0, "note": str(e),
+                })
+                continue
+            if df_raw.empty or df_raw.shape[1] == 0:
+                sheet_info.append({
+                    "sheet": sheet_name, "type": "empty", "rows": 0, "cols": 0,
+                })
+                continue
+            try:
+                classification = _classify_sheet(sheet_name, df_raw)
+            except Exception as e:
+                logger.warning("classify_sheet %r: %s", sheet_name, e)
+                classification = "unknown"
             sheet_info.append({"sheet": sheet_name, "type": classification, "rows": len(df_raw), "cols": len(df_raw.columns)})
-            if classification == "transactions":
-                parsed = _parse_transactions(df_raw, filename)
-                if not parsed.empty:
-                    parsed[C_SOURCE] = company_label
-                    parsed[C_SHEET] = sheet_name
-                    all_transactions.append(parsed)
-            elif classification == "suppliers":
-                parsed = _parse_suppliers(df_raw, raw_bytes, sheet_name)
-                all_suppliers.append(parsed)
-            elif classification == "pivot":
-                parsed = _parse_pivot(df_raw)
-                if not parsed.empty:
-                    parsed[C_SOURCE] = company_label
-                    all_pivots.append(parsed)
-            elif classification in ("liabilities", "summary"):
-                parsed = _parse_transactions(df_raw, filename)
-                if not parsed.empty:
-                    parsed[C_SOURCE] = company_label
-                    parsed[C_SHEET] = sheet_name
-                    all_transactions.append(parsed)
-            else:
-                parsed = _parse_generic(df_raw, filename)
-                if not parsed.empty and len(parsed) >= 2:
-                    parsed[C_SOURCE] = company_label
-                    parsed[C_SHEET] = sheet_name
-                    all_transactions.append(parsed)
+            try:
+                if classification == "transactions":
+                    parsed = _parse_transactions(df_raw, filename)
+                    if not parsed.empty:
+                        parsed[C_SOURCE] = company_label
+                        parsed[C_SHEET] = sheet_name
+                        all_transactions.append(parsed)
+                elif classification == "suppliers":
+                    parsed = _parse_suppliers(df_raw, raw_bytes, sheet_name, filename)
+                    all_suppliers.append(parsed)
+                elif classification == "pivot":
+                    parsed = _parse_pivot(df_raw)
+                    if not parsed.empty:
+                        parsed[C_SOURCE] = company_label
+                        all_pivots.append(parsed)
+                elif classification in ("liabilities", "summary"):
+                    parsed = _parse_transactions(df_raw, filename)
+                    if not parsed.empty:
+                        parsed[C_SOURCE] = company_label
+                        parsed[C_SHEET] = sheet_name
+                        all_transactions.append(parsed)
+                else:
+                    parsed = _parse_generic(df_raw, filename)
+                    if not parsed.empty and len(parsed) >= 2:
+                        parsed[C_SOURCE] = company_label
+                        parsed[C_SHEET] = sheet_name
+                        all_transactions.append(parsed)
+            except Exception as e:
+                logger.warning("Parse failed sheet %r in %s: %s", sheet_name, filename, e)
+                sheet_info[-1]["note"] = str(e)
 
     transactions = pd.concat(all_transactions, ignore_index=True) if all_transactions else pd.DataFrame()
     suppliers = pd.concat(all_suppliers, ignore_index=True) if all_suppliers else pd.DataFrame()
@@ -889,47 +1339,177 @@ def _agg_join_months(series: pd.Series) -> str:
     return ", ".join(sorted(seen))
 
 
+def _agg_join_unique_ids(series: pd.Series) -> str:
+    seen: set[str] = set()
+    for val in series:
+        if pd.isna(val):
+            continue
+        try:
+            iv = int(float(val))
+            seen.add(str(iv))
+        except (ValueError, TypeError):
+            s = str(val).strip()
+            if s and s.lower() != "nan":
+                seen.add(s)
+    return ", ".join(sorted(seen, key=lambda x: (len(x), x)))
+
+
+def _normalize_supplier_group_key(name: str) -> str:
+    """Stable key: trim, NFKC, collapse spaces, case-insensitive (casefold). Empty if unknown."""
+    if name is None or (isinstance(name, float) and pd.isna(name)):
+        return ""
+    s = unicodedata.normalize("NFKC", str(name)).strip()
+    if not s or s.lower() in ("nan", "none", "unknown", ""):
+        return ""
+    s = _strip_leading_konto_prefix(s)
+    s = re.sub(r"\s*,\s*", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().casefold()
+    return s
+
+
+def _consolidate_supplier_casefold(df: pd.DataFrame) -> pd.DataFrame:
+    """Map labels that differ only by case/whitespace/unicode form to one canonical string (longest wins)."""
+    if df.empty or C_SUPPLIER_NAME not in df.columns:
+        return df
+    out = df.copy()
+    s = out[C_SUPPLIER_NAME].fillna("Unknown").astype(str).str.strip()
+    s = s.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+    buckets: dict[str, list[str]] = {}
+    for val in pd.unique(s.values):
+        kk = _normalize_supplier_group_key(val)
+        if not kk:
+            continue
+        buckets.setdefault(kk, []).append(str(val))
+    key_to_canon = {
+        k: max(members, key=lambda x: (len(x), x))
+        for k, members in buckets.items()
+        if members
+    }
+
+    def pick(v: Any) -> str:
+        if pd.isna(v):
+            return "Unknown"
+        vv = str(v).strip()
+        if not vv or vv.lower() in ("nan", "none", ""):
+            return "Unknown"
+        kk = _normalize_supplier_group_key(vv)
+        if not kk:
+            return "Unknown"
+        return key_to_canon.get(kk, vv)
+
+    out[C_SUPPLIER_NAME] = s.map(pick)
+    return out
+
+
+def _canonicalize_supplier_names_by_match_key(ser: pd.Series) -> pd.Series:
+    """Assign one display name per `_supplier_match_key` (longest label wins) so sums group correctly."""
+    s = ser.fillna("Unknown").astype(str).str.strip()
+    s = s.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+    buckets: dict[str, list[str]] = {}
+    for u in pd.unique(s.values):
+        uu = str(u).strip()
+        kk = _supplier_match_key(uu)
+        if not kk or uu.lower() in ("unknown", "nan", "none", ""):
+            buckets.setdefault("__UNK__", []).append(uu)
+            continue
+        buckets.setdefault(kk, []).append(uu)
+    key_to_canon: dict[str, str] = {}
+    for k, members in buckets.items():
+        if k == "__UNK__":
+            key_to_canon[k] = "Unknown"
+            continue
+        key_to_canon[k] = _canonical_supplier_label_for_key(k, members)
+
+    def pick(u: Any) -> str:
+        if pd.isna(u):
+            return "Unknown"
+        uu = str(u).strip()
+        if not uu or uu.lower() in ("unknown", "nan", "none", ""):
+            return "Unknown"
+        kk = _supplier_match_key(uu)
+        if not kk:
+            return key_to_canon.get("__UNK__", "Unknown")
+        return key_to_canon.get(kk, uu)
+
+    return s.map(pick)
+
+
 def _aggregate_by_supplier(df: pd.DataFrame) -> pd.DataFrame:
-    """Consolidate transactions into one row per supplier with summed amounts."""
+    """One row per supplier: summed amounts, merged sources / IDs / months."""
     if df.empty or C_SUPPLIER_NAME not in df.columns:
         return df
 
-    group_cols = [C_SUPPLIER_NAME]
-    if C_SOURCE in df.columns:
-        group_cols.append(C_SOURCE)
+    work = df.copy()
+    for col in (C_DEBIT, C_CREDIT, C_AMOUNT):
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
 
-    agg_dict = {}
-    if C_DEBIT in df.columns:
+    work[C_SUPPLIER_NAME] = _canonicalize_supplier_names_by_match_key(work[C_SUPPLIER_NAME])
+
+    group_cols = [C_SUPPLIER_NAME]
+
+    agg_dict: dict = {}
+    if C_DEBIT in work.columns:
         agg_dict[C_DEBIT] = "sum"
-    if C_CREDIT in df.columns:
+    if C_CREDIT in work.columns:
         agg_dict[C_CREDIT] = "sum"
-    if C_AMOUNT in df.columns:
+    if C_AMOUNT in work.columns:
         agg_dict[C_AMOUNT] = "sum"
 
     if not agg_dict:
         return df
 
-    extra_agg = {}
-    if C_SUPPLIER_ID in df.columns:
-        extra_agg[C_SUPPLIER_ID] = "first"
-    if C_GL_ACCOUNT in df.columns:
-        gl = df[C_GL_ACCOUNT].map(lambda v: str(v).strip() if pd.notna(v) else "")
+    extra_agg: dict = {}
+    if C_SOURCE in work.columns:
+        src = work[C_SOURCE].map(lambda v: str(v).strip() if pd.notna(v) else "")
+        if (src != "").any():
+            extra_agg[C_SOURCE] = _agg_join_unique_strings
+    if C_SUPPLIER_ID in work.columns:
+        extra_agg[C_SUPPLIER_ID] = _agg_join_unique_ids
+    if C_GL_ACCOUNT in work.columns:
+        gl = work[C_GL_ACCOUNT].map(lambda v: str(v).strip() if pd.notna(v) else "")
         if (gl != "").any():
             extra_agg[C_GL_ACCOUNT] = _agg_join_unique_strings
-    if C_COST_CENTER in df.columns:
-        cc = df[C_COST_CENTER].map(lambda v: str(v).strip() if pd.notna(v) else "")
+    if C_COST_CENTER in work.columns:
+        cc = work[C_COST_CENTER].map(lambda v: str(v).strip() if pd.notna(v) else "")
         if (cc != "").any():
             extra_agg[C_COST_CENTER] = _agg_join_unique_strings
-    if C_COMPANY in df.columns:
-        extra_agg[C_COMPANY] = "first"
-    if "Month" in df.columns:
+    if C_COMPANY in work.columns:
+        co = work[C_COMPANY].map(lambda v: str(v).strip() if pd.notna(v) else "")
+        if (co != "").any():
+            extra_agg[C_COMPANY] = _agg_join_unique_strings
+    if "Month" in work.columns:
         extra_agg["Month"] = _agg_join_months
 
     agg_dict.update(extra_agg)
 
-    agg_df = df.groupby(group_cols, as_index=False).agg(agg_dict)
-    agg_df["Transactions"] = df.groupby(group_cols).size().values
-    agg_df = agg_df.sort_values(C_DEBIT, ascending=False).reset_index(drop=True)
+    g = work.groupby(group_cols, as_index=False)
+    agg_df = g.agg(agg_dict)
+    agg_df.insert(1, "Transactions", work.groupby(group_cols).size().values)
+
+    if C_DEBIT in agg_df.columns and C_CREDIT in agg_df.columns:
+        agg_df["NetSpend"] = agg_df[C_DEBIT] - agg_df[C_CREDIT]
+    elif C_AMOUNT in agg_df.columns:
+        agg_df["NetSpend"] = agg_df[C_AMOUNT]
+
+    first_cols = [C_SUPPLIER_NAME, "Transactions"]
+    for c in (C_DEBIT, C_CREDIT, "NetSpend", C_AMOUNT):
+        if c in agg_df.columns:
+            first_cols.append(c)
+    rest = [c for c in agg_df.columns if c not in first_cols]
+    agg_df = agg_df[first_cols + rest]
+    if C_DEBIT in agg_df.columns:
+        sort_col = C_DEBIT
+    elif C_AMOUNT in agg_df.columns:
+        sort_col = C_AMOUNT
+    elif C_CREDIT in agg_df.columns:
+        sort_col = C_CREDIT
+    else:
+        sort_col = C_SUPPLIER_NAME
+    agg_df = agg_df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    dup_n = int(agg_df[C_SUPPLIER_NAME].duplicated().sum())
+    if dup_n:
+        logger.warning("_aggregate_by_supplier: unexpected duplicate supplier rows (%s)", dup_n)
     return agg_df
 
 
@@ -940,7 +1520,33 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_process_file(upload_name: str, raw_bytes: bytes) -> dict:
+    """Cache by filename + bytes so re-runs (widget interaction) stay fast."""
+
+    class _Uploaded:
+        def __init__(self, name: str, blob: bytes):
+            self.name = name
+            self._blob = blob
+
+        def getvalue(self) -> bytes:
+            return self._blob
+
+    return process_file(_Uploaded(upload_name, raw_bytes))
+
+
 EURO = "\u20ac"
+
+_SESSION_KEYS = (
+    "_erp_sig",
+    "_erp_results",
+    "_erp_all_tx",
+    "_erp_all_suppliers",
+    "_erp_all_pivots",
+)
+
+# Streamlit multiselect breaks or hangs with huge option lists (browser payload).
+_MAX_SUPPLIER_MULTISELECT = 400
 
 
 def main() -> None:
@@ -955,83 +1561,219 @@ def main() -> None:
     with st.sidebar:
         st.header("Upload & Filters")
         uploaded_files = st.file_uploader("Upload Excel or CSV files", type=["xlsx", "xls", "csv"], accept_multiple_files=True)
+        st.caption(
+            "Uses **openpyxl** for .xlsx and **xlrd** for legacy .xls (see requirements.txt). "
+            "Password-protected workbooks must be unlocked in Excel first. Max upload **500 MB**."
+        )
 
     if not uploaded_files:
+        for k in _SESSION_KEYS:
+            st.session_state.pop(k, None)
         st.info("Upload one or more Excel/CSV files to get started.\n\n"
                 "The dashboard **auto-detects** sheet types, column names, header rows, "
                 "numeric fields, dates, and categories -- no manual configuration needed.")
         return
 
-    results: list[dict] = []
-    progress = st.progress(0, text="Processing files...")
-    for i, f in enumerate(uploaded_files):
-        results.append(process_file(f))
-        progress.progress((i + 1) / len(uploaded_files), text=f"Processed {f.name}")
-    progress.empty()
+    fp = tuple(f.file_id for f in uploaded_files)
 
-    all_tx = pd.concat([r["transactions"] for r in results if not r["transactions"].empty], ignore_index=True) if any(not r["transactions"].empty for r in results) else pd.DataFrame()
-    all_suppliers = pd.concat([r["suppliers"] for r in results if not r["suppliers"].empty], ignore_index=True) if any(not r["suppliers"].empty for r in results) else pd.DataFrame()
-    all_pivots = pd.concat([r["pivots"] for r in results if not r["pivots"].empty], ignore_index=True) if any(not r["pivots"].empty for r in results) else pd.DataFrame()
+    if st.session_state.get("_erp_sig") != fp:
+        blobs = [(f.name, f.getvalue()) for f in uploaded_files]
+        results: list[dict] = []
+        progress = st.progress(0, text="Processing files...")
+        for i, (fname, raw) in enumerate(blobs):
+            results.append(_cached_process_file(fname, raw))
+            progress.progress((i + 1) / len(blobs), text=f"Processed {fname}")
+        progress.empty()
+
+        all_tx = (
+            pd.concat(
+                [r["transactions"] for r in results if not r["transactions"].empty],
+                ignore_index=True,
+                sort=False,
+            )
+            if any(not r["transactions"].empty for r in results)
+            else pd.DataFrame()
+        )
+        all_suppliers = (
+            pd.concat(
+                [r["suppliers"] for r in results if not r["suppliers"].empty],
+                ignore_index=True,
+                sort=False,
+            )
+            if any(not r["suppliers"].empty for r in results)
+            else pd.DataFrame()
+        )
+        all_pivots = (
+            pd.concat(
+                [r["pivots"] for r in results if not r["pivots"].empty],
+                ignore_index=True,
+                sort=False,
+            )
+            if any(not r["pivots"].empty for r in results)
+            else pd.DataFrame()
+        )
+
+        if all_tx.empty and not all_pivots.empty:
+            all_tx = all_pivots.copy()
+            all_tx[C_DEBIT] = all_tx[C_AMOUNT].clip(lower=0)
+            all_tx[C_CREDIT] = all_tx[C_AMOUNT].clip(upper=0).abs()
+            if C_DATE not in all_tx.columns:
+                all_tx[C_DATE] = pd.NaT
+            if C_DESCRIPTION not in all_tx.columns:
+                all_tx[C_DESCRIPTION] = ""
+
+        if not all_tx.empty or not all_pivots.empty:
+            if C_DATE in all_tx.columns and all_tx[C_DATE].notna().any():
+                all_tx["Month"] = pd.to_datetime(all_tx[C_DATE], errors="coerce").dt.to_period("M").astype(str)
+            else:
+                all_tx["Month"] = "N/A"
+
+            if C_SUPPLIER_NAME in all_tx.columns:
+                sn = all_tx[C_SUPPLIER_NAME].fillna("Unknown").astype(str).str.strip()
+                sn = sn.replace({"": "Unknown", "nan": "Unknown", "None": "Unknown"})
+                all_tx[C_SUPPLIER_NAME] = sn
+                n_distinct = all_tx[C_SUPPLIER_NAME].nunique()
+                n_rows_tx = len(all_tx)
+                if n_distinct > 60_000:
+                    logger.warning(
+                        "Skipping supplier clustering (%s distinct names on %s rows).",
+                        n_distinct,
+                        n_rows_tx,
+                    )
+                else:
+                    non_unknown = sorted(
+                        {
+                            x
+                            for x in all_tx[C_SUPPLIER_NAME].unique().tolist()
+                            if str(x).strip().lower() not in ("unknown", "nan", "")
+                        }
+                    )
+                    if len(non_unknown) > 25_000:
+                        logger.info(
+                            "Skipping match-key supplier collapse (%s unique labels).",
+                            len(non_unknown),
+                        )
+                    elif len(non_unknown) > 1:
+                        mk = _collapse_names_by_match_key(non_unknown)
+                        all_tx[C_SUPPLIER_NAME] = _series_apply_name_map(all_tx[C_SUPPLIER_NAME], mk)
+                    u2 = [
+                        x
+                        for x in all_tx[C_SUPPLIER_NAME].dropna().unique().tolist()
+                        if str(x).strip().lower() not in ("unknown", "nan", "")
+                    ]
+                    if 1 < len(u2) < 2_500 and n_rows_tx < 800_000:
+                        name_map = _fuzzy_group_names(u2, threshold=FUZZY_SUPPLIER_MERGE_THRESHOLD)
+                        all_tx[C_SUPPLIER_NAME] = _series_apply_name_map(all_tx[C_SUPPLIER_NAME], name_map)
+
+            if not all_suppliers.empty and C_SUPPLIER_ID in all_suppliers.columns:
+                sup_dedup = all_suppliers.copy()
+                sup_dedup["_nlen"] = sup_dedup[C_SUPPLIER_NAME].astype(str).str.len()
+                sup_dedup = sup_dedup.sort_values("_nlen", ascending=False).drop_duplicates(subset=[C_SUPPLIER_ID]).drop(
+                    columns=["_nlen"]
+                )
+                all_suppliers = sup_dedup.reset_index(drop=True)
+
+        st.session_state["_erp_sig"] = fp
+        st.session_state["_erp_results"] = results
+        st.session_state["_erp_all_tx"] = all_tx
+        st.session_state["_erp_all_suppliers"] = all_suppliers
+        st.session_state["_erp_all_pivots"] = all_pivots
+
+    try:
+        results = st.session_state["_erp_results"]
+        all_tx = st.session_state["_erp_all_tx"]
+        all_suppliers = st.session_state["_erp_all_suppliers"]
+        all_pivots = st.session_state["_erp_all_pivots"]
+    except KeyError:
+        st.session_state.pop("_erp_sig", None)
+        st.rerun()
+
+    if isinstance(all_tx, pd.DataFrame):
+        all_tx = all_tx.copy()
+        if "Month" not in all_tx.columns:
+            if C_DATE in all_tx.columns and all_tx[C_DATE].notna().any():
+                all_tx["Month"] = (
+                    pd.to_datetime(all_tx[C_DATE], errors="coerce").dt.to_period("M").astype(str)
+                )
+            else:
+                all_tx["Month"] = "N/A"
+        if C_SUPPLIER_NAME in all_tx.columns and not all_tx.empty:
+            all_tx = _consolidate_supplier_casefold(all_tx)
+            all_tx[C_SUPPLIER_NAME] = _canonicalize_supplier_names_by_match_key(all_tx[C_SUPPLIER_NAME])
 
     if all_tx.empty and all_pivots.empty:
         st.error("No transaction data could be extracted from the uploaded files.")
-        with st.expander("File Processing Details"):
+        st.info(
+            "Common causes: amount columns use **German formatting** (e.g. 1.234,56) as text, "
+            "sheets are empty or only pivot/summary, or the header row was not detected. "
+            "Open **File Processing Details** below to see each sheet type and row counts."
+        )
+        with st.expander("File Processing Details", expanded=True):
             for r in results:
                 st.markdown(f"**{r['filename']}**")
                 if r["sheet_info"]:
                     st.dataframe(pd.DataFrame(r["sheet_info"]), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No sheet metadata recorded.")
         return
 
-    if all_tx.empty and not all_pivots.empty:
-        all_tx = all_pivots.copy()
-        all_tx[C_DEBIT] = all_tx[C_AMOUNT].clip(lower=0)
-        all_tx[C_CREDIT] = all_tx[C_AMOUNT].clip(upper=0).abs()
-        if C_DATE not in all_tx.columns:
-            all_tx[C_DATE] = pd.NaT
-        if C_DESCRIPTION not in all_tx.columns:
-            all_tx[C_DESCRIPTION] = ""
-
-    if C_DATE in all_tx.columns and all_tx[C_DATE].notna().any():
-        all_tx["Month"] = pd.to_datetime(all_tx[C_DATE], errors="coerce").dt.to_period("M").astype(str)
-    else:
-        all_tx["Month"] = "N/A"
-
-    if C_SUPPLIER_NAME in all_tx.columns:
-        unique_names = all_tx[C_SUPPLIER_NAME].dropna().unique().tolist()
-        if 1 < len(unique_names) < 2000:
-            name_map = _fuzzy_group_names(unique_names)
-            all_tx[C_SUPPLIER_NAME] = all_tx[C_SUPPLIER_NAME].map(name_map).fillna(all_tx[C_SUPPLIER_NAME])
+    nf = len(results)
+    st.success(
+        f"Loaded **{len(all_tx):,}** transaction rows from **{nf}** file{'s' if nf != 1 else ''}. "
+        f"Similar supplier names are merged at **{int(FUZZY_SUPPLIER_MERGE_THRESHOLD * 100)}%** match; "
+        f"amounts sum to **one row per supplier** in the summary below. Use sidebar filters as needed."
+    )
 
     with st.expander("Uploaded Files Overview", expanded=False):
         for r in results:
             st.markdown(f"**{r['filename']}** -- Company: *{r['company']}*")
             st.dataframe(pd.DataFrame(r["sheet_info"]), use_container_width=True, hide_index=True)
 
-    with st.expander("Cleaned Data Preview", expanded=False):
-        tab_tx, tab_sup = st.tabs(["Transactions", "Suppliers"])
-        with tab_tx:
-            st.dataframe(all_tx.head(100), use_container_width=True, hide_index=True)
-        with tab_sup:
-            if not all_suppliers.empty:
-                st.dataframe(all_suppliers.head(100), use_container_width=True, hide_index=True)
-            else:
-                st.info("No supplier master data found.")
-
     with st.sidebar:
         st.markdown("---")
         selected_companies = []
         if C_SOURCE in all_tx.columns:
-            selected_companies = st.multiselect("Company / File", options=sorted(all_tx[C_SOURCE].dropna().unique().tolist()), default=[])
+            selected_companies = st.multiselect(
+                "Company / File",
+                options=_safe_sort_filter_options(all_tx[C_SOURCE].dropna().unique().tolist()),
+                default=[],
+            )
         selected_suppliers = []
         if C_SUPPLIER_NAME in all_tx.columns:
-            selected_suppliers = st.multiselect("Supplier", options=sorted(all_tx[C_SUPPLIER_NAME].dropna().unique().tolist()), default=[])
-        month_options = sorted([m for m in all_tx["Month"].dropna().unique().tolist() if m != "N/A"])
+            supplier_all = sorted(
+                {
+                    str(s).strip()
+                    for s in all_tx[C_SUPPLIER_NAME].dropna().tolist()
+                    if str(s).strip() and str(s).strip().lower() not in ("nan", "unknown")
+                }
+            )
+            if not supplier_all:
+                selected_suppliers = []
+            elif len(supplier_all) > _MAX_SUPPLIER_MULTISELECT:
+                st.caption(
+                    f"{len(supplier_all):,} suppliers — use **Supplier name contains** to narrow "
+                    f"(multiselect shows up to {_MAX_SUPPLIER_MULTISELECT} matches)."
+                )
+                q = st.text_input("Supplier name contains", value="", key="erp_supplier_search")
+                qlow = q.strip().lower()
+                if qlow:
+                    filtered = [x for x in supplier_all if qlow in x.lower()][: _MAX_SUPPLIER_MULTISELECT]
+                else:
+                    filtered = supplier_all[: _MAX_SUPPLIER_MULTISELECT]
+                selected_suppliers = st.multiselect("Supplier", options=filtered, default=[])
+            else:
+                selected_suppliers = st.multiselect("Supplier", options=supplier_all, default=[])
+        month_options = (
+            _safe_sort_filter_options([m for m in all_tx["Month"].dropna().unique().tolist() if m != "N/A"])
+            if "Month" in all_tx.columns
+            else []
+        )
         selected_months = st.multiselect("Month", options=month_options, default=[])
         extra_filters: dict[str, list] = {}
         for col in [c for c in [C_GL_ACCOUNT, C_COST_CENTER, C_CATEGORY] if c in all_tx.columns]:
             vals = all_tx[col].dropna()
             vals = vals[vals.astype(str).str.strip() != ""]
-            uv = sorted(vals.unique().tolist())
+            uv = _safe_sort_filter_options(vals.unique().tolist())
             if 2 <= len(uv) <= 100:
                 sel = st.multiselect(col, options=uv, default=[])
                 if sel:
@@ -1058,6 +1800,16 @@ def main() -> None:
     k3.metric("Net Amount", f"{EURO} {total_net:,.2f}")
     k4.metric("Unique Suppliers", f"{n_suppliers:,}")
     k5.metric("Files / Records", f"{len(uploaded_files)} / {len(view):,}")
+    st.markdown("---")
+
+    agg_view = _aggregate_by_supplier(view)
+    st.subheader("Supplier summary — one row per supplier")
+    st.caption(
+        f"Names that are **≥{int(FUZZY_SUPPLIER_MERGE_THRESHOLD * 100)}%** similar (fuzzy match) are treated as one supplier; "
+        "**Debit**, **Credit**, and **Amount** are **added** across all matching rows. "
+        "Transaction count, months, and sources are combined. Detail lines stay in 'All Individual Transactions'."
+    )
+    st.dataframe(agg_view, use_container_width=True, height=420, hide_index=True)
     st.markdown("---")
 
     col_left, col_right = st.columns(2)
@@ -1172,10 +1924,6 @@ def main() -> None:
             fig.update_layout(height=500)
             st.plotly_chart(fig, use_container_width=True)
             st.markdown("---")
-
-    st.subheader("Supplier Summary (Aggregated)")
-    agg_view = _aggregate_by_supplier(view)
-    st.dataframe(agg_view, use_container_width=True, height=400, hide_index=True)
 
     with st.expander("All Individual Transactions", expanded=False):
         st.dataframe(view, use_container_width=True, height=400, hide_index=True)

@@ -1,6 +1,10 @@
 [server]
 headless = true
 port = 8501
+maxUploadSize = 500
+
+[runner]
+fastReruns = true
 
 [browser]
 gatherUsageStats = false
