@@ -45,13 +45,15 @@ _COLUMN_SIGNATURES: dict[str, list[str]] = {
         "supplier id", "supplierid", "konto", "lieferant nummer 2",
         "dim_subledgeraccount", "kontonummer", "account number", "account no",
         "debitor nr", "debitornr", "kunden nr", "kundennr", "vendor id",
-        "vendor no", "vendor number", "lieferanten nummer",
+        "vendor no", "vendor number", "lieferanten nummer", "manufacturer code",
+        "lieferant code", "lieferantcode", "creditor code", "creditorcode",
     ],
     C_SUPPLIER_NAME: [
         "lieferant name", "lieferantname", "lieferant", "kreditorenname",
         "supplier name", "suppliername", "beschriftung", "kurzbezeichnung",
         "name", "firma", "vendor name", "lieferantenname", "kontobezeichnung",
-        "bezeichnung", "account name", "manufacturer",
+        "bezeichnung", "account name", "manufacturer name", "manufacturedname",
+        "creditor name", "creditorname",
     ],
     C_DEBIT: [
         "soll", "debit", "umsatz soll", "soll betrag", "sollbetrag",
@@ -109,7 +111,7 @@ _REFERENCE_LOADED = False
 _XLSX_ROW_WARN = 200_000
 
 # Merge supplier labels when fuzzy similarity ≥ this (88% = 0.88); debit/credit then sum per merged name.
-FUZZY_SUPPLIER_MERGE_THRESHOLD = 0.88
+FUZZY_SUPPLIER_MERGE_THRESHOLD = 0.95
 
 
 def _load_reference_schema_aliases() -> None:
@@ -282,6 +284,22 @@ def _drop_descriptor_rows(df: pd.DataFrame) -> pd.DataFrame:
     if rename_map:
         df = df.rename(columns=rename_map)
     df = df.iloc[1:].reset_index(drop=True)
+    return df
+
+
+def _skip_title_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Skip rows that are titles/metadata (long text in first column, few useful columns)."""
+    if df.empty or len(df) < 2:
+        return df
+    first_col = df.iloc[:, 0]
+    for idx, val in enumerate(first_col):
+        if idx > 5:
+            break
+        vs = str(val).strip() if pd.notna(val) else ""
+        if not vs:
+            continue
+        if len(vs) > 50 and any(kw in vs.lower() for kw in ("rechnungswesen", "kanzlei", "kreditorenstammdaten", "kreditor")):
+            return df.iloc[idx+1:].reset_index(drop=True)
     return df
 
 
@@ -473,6 +491,8 @@ def _read_excel_sheet_robust(raw_bytes: bytes, sheet_name: str, filename: str = 
                 )
             df = _sanitize_dataframe_columns(df)
             df = _maybe_fill_merged_first_column(df)
+            df = _skip_title_rows(df)
+            df = _drop_descriptor_rows(df)
             unnamed = sum(
                 1
                 for c in df.columns
@@ -495,6 +515,8 @@ def _read_excel_sheet_robust(raw_bytes: bytes, sheet_name: str, filename: str = 
                         df = pd.read_excel(bio, sheet_name=sheet_name, header=try_row, **extra)
                         df = _sanitize_dataframe_columns(df)
                         df = _maybe_fill_merged_first_column(df)
+                        df = _skip_title_rows(df)
+                        df = _drop_descriptor_rows(df)
                         break
             return df
         except Exception as e:
@@ -1169,8 +1191,19 @@ def _merge_transactions_suppliers(transactions: pd.DataFrame, suppliers: pd.Data
             sup_merge = sup_merge.rename(columns={C_SUPPLIER_NAME: "_SupName"})
         merged = transactions.merge(sup_merge, on=C_SUPPLIER_ID, how="left")
         if "_SupName" in merged.columns:
-            mask = merged[C_SUPPLIER_NAME].isin(["Unknown", "nan", ""])
+            # Check which rows have missing/invalid supplier names
+            current_str = merged[C_SUPPLIER_NAME].fillna("").astype(str).str.strip()
+
+            # Detect numeric IDs: pure numbers with optional dots/dashes
+            is_numeric_id = current_str.apply(lambda x: bool(x) and x.replace(".", "").replace("-", "").isdigit())
+
+            # Detect missing/unknown values
+            is_missing = current_str.str.lower().isin(["unknown", "nan", "", "none", "<na>"])
+
+            # Replace where appropriate
+            mask = (is_missing | is_numeric_id) & merged["_SupName"].notna()
             merged.loc[mask, C_SUPPLIER_NAME] = merged.loc[mask, "_SupName"]
+
             merged.drop(columns=["_SupName"], inplace=True)
     if C_COMPANY not in merged.columns:
         merged[C_COMPANY] = "Unknown"
@@ -1394,7 +1427,7 @@ def _consolidate_supplier_casefold(df: pd.DataFrame) -> pd.DataFrame:
             return "Unknown"
         kk = _normalize_supplier_group_key(vv)
         if not kk:
-            return "Unknown"
+            return vv
         return key_to_canon.get(kk, vv)
 
     out[C_SUPPLIER_NAME] = s.map(pick)
@@ -1428,7 +1461,7 @@ def _canonicalize_supplier_names_by_match_key(ser: pd.Series) -> pd.Series:
             return "Unknown"
         kk = _supplier_match_key(uu)
         if not kk:
-            return key_to_canon.get("__UNK__", "Unknown")
+            return uu
         return key_to_canon.get(kk, uu)
 
     return s.map(pick)
@@ -1543,10 +1576,58 @@ _SESSION_KEYS = (
     "_erp_all_tx",
     "_erp_all_suppliers",
     "_erp_all_pivots",
+    "_erp_errors",
 )
 
 # Streamlit multiselect breaks or hangs with huge option lists (browser payload).
 _MAX_SUPPLIER_MULTISELECT = 400
+
+
+def _handle_file_error(filename: str, error: Exception, error_type: str = "unknown") -> dict:
+    """Create user-friendly error message for file processing issues."""
+    error_msg = str(error)
+
+    if "encrypted" in error_msg.lower() or "password" in error_msg.lower():
+        user_msg = f"❌ **{filename}**: File is password-protected. Please unlock it in Excel first and re-save."
+        error_code = "PASSWORD_PROTECTED"
+    elif "xlrd" in error_msg.lower() and filename.lower().endswith(".xls"):
+        user_msg = f"❌ **{filename}**: Unsupported .xls format. Please convert to .xlsx first."
+        error_code = "XLS_FORMAT"
+    elif "truncated" in error_msg.lower() or "corrupt" in error_msg.lower():
+        user_msg = f"❌ **{filename}**: File appears to be corrupted. Please re-download and try again."
+        error_code = "CORRUPTED_FILE"
+    elif "sheet" in error_msg.lower() and "not found" in error_msg.lower():
+        user_msg = f"❌ **{filename}**: Expected sheets (Materialkonten/Kreditoren) not found."
+        error_code = "MISSING_SHEETS"
+    elif "encoding" in error_msg.lower() or "codec" in error_msg.lower():
+        user_msg = f"❌ **{filename}**: File encoding issue. Try saving as UTF-8 in Excel."
+        error_code = "ENCODING_ERROR"
+    elif "memory" in error_msg.lower():
+        user_msg = f"❌ **{filename}**: File is too large. Please split into smaller files."
+        error_code = "OUT_OF_MEMORY"
+    else:
+        user_msg = f"❌ **{filename}**: {error_msg[:100]}{'...' if len(error_msg) > 100 else ''}"
+        error_code = "UNKNOWN_ERROR"
+
+    return {
+        "filename": filename,
+        "message": user_msg,
+        "error_code": error_code,
+        "technical_error": error_msg,
+    }
+
+
+def _show_error_modal(errors: list) -> None:
+    """Display error messages in a user-friendly format."""
+    if not errors:
+        return
+
+    with st.container():
+        st.error("⚠️ **File Processing Errors**")
+        for error in errors:
+            st.markdown(error["message"])
+            with st.expander("Technical details"):
+                st.code(error["technical_error"], language="text")
 
 
 def main() -> None:
@@ -1579,11 +1660,24 @@ def main() -> None:
     if st.session_state.get("_erp_sig") != fp:
         blobs = [(f.name, f.getvalue()) for f in uploaded_files]
         results: list[dict] = []
+        errors: list[dict] = []
         progress = st.progress(0, text="Processing files...")
         for i, (fname, raw) in enumerate(blobs):
-            results.append(_cached_process_file(fname, raw))
-            progress.progress((i + 1) / len(blobs), text=f"Processed {fname}")
+            try:
+                result = _cached_process_file(fname, raw)
+                results.append(result)
+                progress.progress((i + 1) / len(blobs), text=f"✓ Processed {fname}")
+            except Exception as e:
+                error_info = _handle_file_error(fname, e)
+                errors.append(error_info)
+                logger.error(f"File processing error: {fname} - {str(e)}")
+                progress.progress((i + 1) / len(blobs), text=f"✗ Failed {fname}")
         progress.empty()
+
+        # Show errors if any
+        if errors:
+            _show_error_modal(errors)
+            st.session_state["_erp_errors"] = errors
 
         all_tx = (
             pd.concat(
@@ -1702,11 +1796,18 @@ def main() -> None:
             all_tx[C_SUPPLIER_NAME] = _canonicalize_supplier_names_by_match_key(all_tx[C_SUPPLIER_NAME])
 
     if all_tx.empty and all_pivots.empty:
-        st.error("No transaction data could be extracted from the uploaded files.")
+        # Show any processing errors first
+        if st.session_state.get("_erp_errors"):
+            _show_error_modal(st.session_state["_erp_errors"])
+
+        st.error("❌ No transaction data could be extracted from the uploaded files.")
         st.info(
-            "Common causes: amount columns use **German formatting** (e.g. 1.234,56) as text, "
-            "sheets are empty or only pivot/summary, or the header row was not detected. "
-            "Open **File Processing Details** below to see each sheet type and row counts."
+            "**Possible causes:**\n"
+            "- Sheets are empty or contain only summaries\n"
+            "- Header row was not detected correctly\n"
+            "- File format or encoding issue\n"
+            "- Password-protected or corrupted file\n\n"
+            "Open **File Processing Details** below to see diagnostics."
         )
         with st.expander("File Processing Details", expanded=True):
             for r in results:
